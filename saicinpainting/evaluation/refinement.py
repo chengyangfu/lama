@@ -14,7 +14,7 @@ from saicinpainting.training.modules.ffc import FFCResnetBlock
 from saicinpainting.training.modules.pix2pixhd import ResnetBlock
 
 from tqdm import tqdm
-
+import pdb
 
 def _pyrdown(im : torch.Tensor, downsize : tuple=None):
     """downscale the image"""
@@ -118,6 +118,7 @@ def _infer(
     torch.Tensor
         inpainted image
     """
+    pdb.set_trace()
     masked_image = image * (1 - mask)
     masked_image = torch.cat([masked_image, mask], dim=1)
 
@@ -197,9 +198,12 @@ def _get_image_mask_pyramid(batch : dict, min_side : int, max_scales : int, px_b
 
     h, w = batch['unpad_to_size']
     h, w = h[0].item(), w[0].item()
-
+    
+    #h, w = batch['image'].shape[2], batch['image'].shape[3]
     image = batch['image'][...,:h,:w]
     mask = batch['mask'][...,:h,:w]
+    #pdb.set_trace()
+    
     if h*w > px_budget:
         #resize 
         ratio = np.sqrt(px_budget / float(h*w))
@@ -209,7 +213,8 @@ def _get_image_mask_pyramid(batch : dict, min_side : int, max_scales : int, px_b
         image = resize(image, (h,w),interpolation='bilinear', align_corners=False)
         mask = resize(mask, (h,w),interpolation='bilinear', align_corners=False)
         mask[mask>1e-8] = 1        
-    breadth = min(h,w)
+    
+    breadth = min(h,w) 
     n_scales = min(1 + int(round(max(0,np.log2(breadth / min_side)))), max_scales)        
     ls_images = []
     ls_masks = []
@@ -263,6 +268,7 @@ def refine_predict(
     assert not inpainter.add_noise_kwargs
     assert inpainter.concat_mask
 
+    pdb.set_trace()
     gpu_ids = [f'cuda:{gpuid}' for gpuid in gpu_ids.replace(" ","").split(",") if gpuid.isdigit()]
     n_resnet_blocks = 0
     first_resblock_ind = 0

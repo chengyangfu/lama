@@ -9,6 +9,7 @@ from torch import nn
 
 from saicinpainting.training.trainers import load_checkpoint
 from saicinpainting.utils import register_debug_signal_handlers
+import pdb
 
 
 class JITWrapper(nn.Module):
@@ -27,6 +28,7 @@ class JITWrapper(nn.Module):
 
 @hydra.main(config_path="../configs/prediction", config_name="default.yaml")
 def main(predict_config: OmegaConf):
+    pdb.set_trace()
     register_debug_signal_handlers()  # kill -10 <pid> will result in traceback dumped into log
 
     train_config_path = os.path.join(predict_config.model.path, "config.yaml")
@@ -45,7 +47,8 @@ def main(predict_config: OmegaConf):
     model.eval()
     jit_model_wrapper = JITWrapper(model)
 
-    image = torch.rand(1, 3, 120, 120)
+    pdb.set_trace()
+    image =torch.rand(1, 3, 120, 120)
     mask = torch.rand(1, 1, 120, 120)
     output = jit_model_wrapper(image, mask)
 
@@ -56,6 +59,7 @@ def main(predict_config: OmegaConf):
 
     image = image.to(device)
     mask = mask.to(device)
+    model = model.to(device)
     traced_model = torch.jit.trace(jit_model_wrapper, (image, mask), strict=False).to(device)
 
     save_path = Path(predict_config.save_path)

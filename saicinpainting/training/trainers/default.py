@@ -1,8 +1,10 @@
 import logging
-
+import torch.nn as nn
 import torch
 import torch.nn.functional as F
 from omegaconf import OmegaConf
+import cv2
+from torch.optim import Adam, SGD 
 
 from saicinpainting.training.data.datasets import make_constant_area_crop_params
 from saicinpainting.training.losses.distance_weighting import make_mask_distance_weighter
@@ -10,6 +12,11 @@ from saicinpainting.training.losses.feature_matching import feature_matching_los
 from saicinpainting.training.modules.fake_fakes import FakeFakesGenerator
 from saicinpainting.training.trainers.base import BaseInpaintingTrainingModule, make_multiscale_noise
 from saicinpainting.utils import add_prefix_to_keys, get_ramp
+from saicinpainting.evaluation.data import pad_tensor_to_modulo
+from saicinpainting.evaluation.refinement import  _get_image_mask_pyramid, _pyrdown, _pyrdown_mask, _erode_mask, _l1_loss
+from saicinpainting.evaluation.utils import move_to_device
+from tqdm import tqdm
+import pdb
 
 LOGGER = logging.getLogger(__name__)
 
@@ -173,3 +180,127 @@ class DefaultInpaintingTrainingModule(BaseInpaintingTrainingModule):
             metrics.update(add_prefix_to_keys(fake_fakes_adv_metrics, 'adv_'))
 
         return total_loss, metrics
+
+
+class RefineInpaintingTrainingModule(DefaultInpaintingTrainingModule):
+    def __init__(self, *args, inpainter: nn.Module, modulo : int, n_iters : int, lr : float, min_side : int, 
+    max_scales : int, px_budget : int,  **kwargs):
+        # Copy all the attributes from DefaultInpaintingTrainingModule to RefineInpaintingTrainingModule
+        for attr in inpainter.__dict__:
+            setattr(self, attr, getattr(inpainter, attr))
+        
+        self.refine_modulo = modulo
+        self.refine_n_iters = n_iters
+        self.refine_lr = lr
+        self.refine_min_side = min_side
+        self.refine_max_scales = max_scales
+        self.refine_px_budget = px_budget
+        # separate the generator.model to two parts. 
+        self.forward_front = inpainter.generator.model[0:5]
+        self.forward_rear = inpainter.generator.model[5:]
+    
+
+    def forward(self, batch):
+
+        ls_images, ls_masks = _get_image_mask_pyramid(
+            batch, 
+            self.refine_min_side, 
+            self.refine_max_scales, 
+            self.refine_px_budget
+        )
+        image_inpainted = None
+       
+
+        for ids, (image, mask) in enumerate(zip(ls_images, ls_masks)):
+            orig_shape = image.shape[2:]
+            image = pad_tensor_to_modulo(image, self.refine_modulo)
+            mask = pad_tensor_to_modulo(mask, self.refine_modulo)
+            mask[mask >= 1e-8] = 1.0
+            mask[mask < 1e-8] = 0.0
+            image, mask = move_to_device(image, self.device), move_to_device(mask, self.device)
+            if image_inpainted is not None:
+                image_inpainted = move_to_device(image_inpainted, self.device)
+            image_inpainted = self._infer(image, mask, image_inpainted, orig_shape, ids, self.refine_n_iters, self.refine_lr)
+            image_inpainted = image_inpainted[:,:,:orig_shape[0], :orig_shape[1]]
+            # detach everything to save resources
+            image = image.detach().cpu()
+            mask = mask.detach().cpu()
+        
+        return image_inpainted
+
+    def _infer(self, 
+        image : torch.Tensor, mask : torch.Tensor, 
+        ref_lower_res : torch.Tensor, orig_shape : tuple, 
+        scale_ind : int, n_iters : int=15, lr : float=0.002):
+        """Performs inference with refinement at a given scale.
+
+        Parameters
+        ----------
+        image : torch.Tensor
+            input image to be inpainted, of size (1,3,H,W)
+        mask : torch.Tensor
+            input inpainting mask, of size (1,1,H,W) 
+        ref_lower_res : torch.Tensor
+            the inpainting at previous scale, used as reference image
+        orig_shape : tuple
+            shape of the original input image before padding
+        device : torch.device
+            device used for inference.
+        scale_ind : int
+            the scale index
+        n_iters : int, optional
+            number of iterations of refinement, by default 15
+        lr : float, optional
+            learning rate, by default 0.002
+
+        Returns
+        -------
+        torch.Tensor
+            inpainted image
+        """
+        masked_image = image * (1 - mask)
+        masked_image = torch.cat([masked_image, mask], dim=1)
+
+        mask = mask.repeat(1,3,1,1)
+        if ref_lower_res is not None:
+            ref_lower_res = ref_lower_res.detach()
+        with torch.no_grad():
+            z1,z2 = self.forward_front(masked_image)
+        # Inference
+        mask = mask.to(self.device)
+        ekernel = torch.from_numpy(cv2.getStructuringElement(cv2.MORPH_ELLIPSE,(15,15)).astype(bool)).float()
+        ekernel = ekernel.to(self.device)
+        image = image.to(self.device)
+        z1, z2 = z1.detach(), z2.detach()
+        z1.requires_grad, z2.requires_grad = True, True
+
+        optimizer = Adam([z1,z2], lr=lr)
+
+        pbar = tqdm(range(n_iters), leave=False)
+        for idi in pbar:
+            optimizer.zero_grad()
+            input_feat = (z1,z2)
+            pred = self.forward_rear(input_feat)
+            if ref_lower_res is None:
+                break
+            losses = {}
+            ######################### multi-scale #############################
+            # scaled loss with downsampler
+            pred_downscaled = _pyrdown(pred[:,:,:orig_shape[0],:orig_shape[1]])
+            mask_downscaled = _pyrdown_mask(mask[:,:1,:orig_shape[0],:orig_shape[1]], blur_mask=False, round_up=False)
+            mask_downscaled = _erode_mask(mask_downscaled, ekernel=ekernel)
+            mask_downscaled = mask_downscaled.repeat(1,3,1,1)
+            losses["ms_l1"] = _l1_loss(pred, pred_downscaled, ref_lower_res, mask, mask_downscaled, image, on_pred=True)
+
+            loss = sum(losses.values())
+            pbar.set_description("Refining scale {} using scale {} ...current loss: {:.4f}".format(scale_ind+1, scale_ind, loss.item()))
+            if idi < n_iters - 1:
+                loss.backward()
+                optimizer.step()
+                del pred_downscaled
+                del loss
+                del pred
+        # "pred" is the prediction after Plug-n-Play module
+        inpainted = mask * pred + (1 - mask) * image
+        inpainted = inpainted.detach().cpu()
+        return inpainted

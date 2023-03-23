@@ -13,6 +13,7 @@ import traceback
 
 from saicinpainting.evaluation.utils import move_to_device
 from saicinpainting.evaluation.refinement import refine_predict
+
 os.environ['OMP_NUM_THREADS'] = '1'
 os.environ['OPENBLAS_NUM_THREADS'] = '1'
 os.environ['MKL_NUM_THREADS'] = '1'
@@ -31,6 +32,10 @@ from torch.utils.data._utils.collate import default_collate
 from saicinpainting.training.data.datasets import make_default_val_dataset
 from saicinpainting.training.trainers import load_checkpoint
 from saicinpainting.utils import register_debug_signal_handlers
+
+from  saicinpainting.training.trainers.default import RefineInpaintingTrainingModule
+
+import pdb
 
 LOGGER = logging.getLogger(__name__)
 
@@ -54,6 +59,8 @@ def main(predict_config: OmegaConf):
         checkpoint_path = os.path.join(predict_config.model.path, 
                                        'models', 
                                        predict_config.model.checkpoint)
+
+        pdb.set_trace()
         model = load_checkpoint(train_config, checkpoint_path, strict=False, map_location='cpu')
         model.freeze()
         if not predict_config.get('refine', False):
@@ -62,7 +69,9 @@ def main(predict_config: OmegaConf):
         if not predict_config.indir.endswith('/'):
             predict_config.indir += '/'
 
+        pdb.set_trace()
         dataset = make_default_val_dataset(predict_config.indir, **predict_config.dataset)
+
         for img_i in tqdm.trange(len(dataset)):
             mask_fname = dataset.mask_filenames[img_i]
             cur_out_fname = os.path.join(
@@ -70,12 +79,20 @@ def main(predict_config: OmegaConf):
                 os.path.splitext(mask_fname[len(predict_config.indir):])[0] + out_ext
             )
             os.makedirs(os.path.dirname(cur_out_fname), exist_ok=True)
+            pdb.set_trace()
             batch = default_collate([dataset[img_i]])
+
             if predict_config.get('refine', False):
                 assert 'unpad_to_size' in batch, "Unpadded size is required for the refinement"
                 # image unpadding is taken care of in the refiner, so that output image
                 # is same size as the input image
-                cur_res = refine_predict(batch, model, **predict_config.refiner)
+                predict_config.refiner.gpu_ids='0' #(disable multi gpu )
+                pdb.set_trace()
+                refine_model = RefineInpaintingTrainingModule(inpainter=model,  **predict_config.refiner)
+                refine_model.to(device)
+                cur_res = refine_model(batch)
+
+                #cur_res = refine_predict(batch, model, **predict_config.refiner)
                 cur_res = cur_res[0].permute(1,2,0).detach().cpu().numpy()
             else:
                 with torch.no_grad():
